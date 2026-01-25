@@ -1,0 +1,1 @@
+docker run -d -e OPENAI_API_KEY=lm-studio -e OPENAI_API_BASE=http://192.168.68.111:1234/v1 -p 8050:8765 mem0/openmemory-mcp:latest

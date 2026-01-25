@@ -1,0 +1,396 @@
+# ═══════════════════════════════════════════════════════════════════════════════
+# KNIGHTBOT SETUP - PART 2C (Main Page + Final)
+# Save as: setup-knightbot-part2c.ps1
+# ═══════════════════════════════════════════════════════════════════════════════
+$BaseDir = "F:\KnightBot"
+Write-Host "`n🛡️ KNIGHTBOT PART 2C - Main Page + Final Setup`n" -ForegroundColor Cyan
+# ─── PAGE.TSX (Main Application) ───
+@'
+'use client';
+...
+'@ | Set-Content "$BaseDir\frontend\src\app\page.tsx" -Encoding UTF8
+import { useState, useRef, useCallback, useEffect } from 'react';
+import { Header } from '@/components/Header';
+import { Sidebar } from '@/components/Sidebar';
+import { ChatContainer } from '@/components/ChatContainer';
+import { InputBar } from '@/components/InputBar';
+import { VoiceOverlay } from '@/components/VoiceOverlay';
+import { useStore } from '@/lib/store';
+import { sendMessage, synthesizeSpeech, transcribeAudio } from '@/lib/api';
+export default function Home() {
+  const {
+    messages, addMessage, updateMessage,
+    isVoiceMode, setVoiceMode,
+    isListening, setListening,
+    isSpeaking, setSpeaking,
+    isMuted
+  } = useStore();
+  const [input, setInput] = useState('');
+  const [isLoading, setIsLoading] = useState(false);
+  const [sidebarOpen, setSidebarOpen] = useState(false);
+  const audioRef = useRef<HTMLAudioElement | null>(null);
+  const mediaRecorderRef = useRef<MediaRecorder | null>(null);
+  const chunksRef = useRef<Blob[]>([]);
+  // Send message to Knight
+  const handleSend = useCallback(async (text: string) => {
+    if (!text.trim() || isLoading) return;
+    const userMsg = {
+      id: Date.now().toString(),
+      role: 'user' as const,
+      content: text,
+      timestamp: new Date()
+    };
+    addMessage(userMsg);
+    setInput('');
+    setIsLoading(true);
+    const assistantId = (Date.now() + 1).toString();
+    addMessage({
+      id: assistantId,
+      role: 'assistant',
+      content: '',
+      timestamp: new Date(),
+      isStreaming: true
+    });
+    try {
+      const response = await sendMessage(text);
+      updateMessage(assistantId, {
+        content: response.text,
+        isStreaming: false
+      });
+      // Text-to-speech if in voice mode and not muted
+      if (isVoiceMode && !isMuted) {
+        setSpeaking(true);
+        try {
+          const audioBlob = await synthesizeSpeech(response.text);
+          const audioUrl = URL.createObjectURL(audioBlob);
+          audioRef.current = new Audio(audioUrl);
+          audioRef.current.onended = () => {
+            setSpeaking(false);
+            URL.revokeObjectURL(audioUrl);
+            // Auto-resume listening after Knight finishes speaking
+            if (isVoiceMode) {
+              setTimeout(() => startListening(), 500);
+            }
+          };
+          audioRef.current.onerror = () => {
+            setSpeaking(false);
+            URL.revokeObjectURL(audioUrl);
+          };
+          await audioRef.current.play();
+        } catch (e) {
+          console.error('TTS failed:', e);
+          setSpeaking(false);
+        }
+      }
+    } catch (error) {
+      console.error('Chat error:', error);
+      updateMessage(assistantId, {
+        content: '[sigh] Something went wrong. Make sure the backend is running on port 8100.',
+        isStreaming: false,
+        isError: true
+      });
+    } finally {
+      setIsLoading(false);
+    }
+  }, [isLoading, isVoiceMode, isMuted, addMessage, updateMessage, setSpeaking]);
+  // Start voice recording
+  const startListening = useCallback(async () => {
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({
+        audio: { echoCancellation: true, noiseSuppression: true }
+      });
+      const mediaRecorder = new MediaRecorder(stream, { mimeType: 'audio/webm' });
+      mediaRecorderRef.current = mediaRecorder;
+      chunksRef.current = [];
+      mediaRecorder.ondataavailable = (e) => {
+        if (e.data.size > 0) chunksRef.current.push(e.data);
+      };
+      mediaRecorder.onstop = async () => {
+        const audioBlob = new Blob(chunksRef.current, { type: 'audio/webm' });
+        stream.getTracks().forEach(t => t.stop());
+        setListening(false);
+        if (audioBlob.size > 1000) { // Only process if there's actual audio
+          try {
+            const result = await transcribeAudio(audioBlob);
+            if (result.text && result.text.trim() && !result.error) {
+              handleSend(result.text);
+            }
+          } catch (e) {
+            console.error('STT failed:', e);
+          }
+        }
+      };
+      mediaRecorder.start();
+      setListening(true);
+    } catch (e) {
+      console.error('Microphone access denied:', e);
+      alert('Microphone access is required for voice mode. Please allow microphone access and try again.');
+    }
+  }, [handleSend, setListening]);
+  // Stop voice recording
+  const stopListening = useCallback(() => {
+    if (mediaRecorderRef.current && mediaRecorderRef.current.state === 'recording') {
+      mediaRecorderRef.current.stop();
+    }
+  }, []);
+  // Interrupt Knight (stop audio playback)
+  const handleInterrupt = useCallback(() => {
+    if (audioRef.current) {
+      audioRef.current.pause();
+      audioRef.current.currentTime = 0;
+      audioRef.current = null;
+    }
+    setSpeaking(false);
+    if (mediaRecorderRef.current?.state === 'recording') {
+      mediaRecorderRef.current.stop();
+    }
+    setListening(false);
+  }, [setSpeaking, setListening]);
+  // Toggle voice mode
+  const toggleVoiceMode = useCallback(() => {
+    if (isVoiceMode) {
+      handleInterrupt();
+      setVoiceMode(false);
+    } else {
+      setVoiceMode(true);
+      startListening();
+    }
+  }, [isVoiceMode, handleInterrupt, setVoiceMode, startListening]);
+  // Keyboard shortcuts
+  useEffect(() => {
+    const handleKeyDown = (e: KeyboardEvent) => {
+      // Escape - interrupt everything
+      if (e.key === 'Escape') {
+        handleInterrupt();
+        if (isVoiceMode) setVoiceMode(false);
+      }
+      // Ctrl+V - toggle voice mode (when not in input)
+      if (e.key === 'v' && e.ctrlKey && document.activeElement?.tagName !== 'TEXTAREA') {
+        e.preventDefault();
+        toggleVoiceMode();
+      }
+      // Space - stop listening (when in voice mode)
+      if (e.key === ' ' && isListening && document.activeElement?.tagName !== 'TEXTAREA') {
+        e.preventDefault();
+        stopListening();
+      }
+    };
+    window.addEventListener('keydown', handleKeyDown);
+    return () => window.removeEventListener('keydown', handleKeyDown);
+  }, [handleInterrupt, toggleVoiceMode, isVoiceMode, isListening, stopListening, setVoiceMode]);
+  // Click anywhere to interrupt when speaking
+  useEffect(() => {
+    const handleClick = () => {
+      if (isSpeaking) handleInterrupt();
+    };
+    if (isSpeaking && isVoiceMode) {
+      window.addEventListener('click', handleClick);
+      return () => window.removeEventListener('click', handleClick);
+    }
+  }, [isSpeaking, isVoiceMode, handleInterrupt]);
+  return (
+    <div className="flex h-screen bg-knight-bg overflow-hidden">
+      <Sidebar isOpen={sidebarOpen} onClose={() => setSidebarOpen(false)} />
+      <main className="flex-1 flex flex-col min-w-0">
+        <Header
+          onMenuClick={() => setSidebarOpen(true)}
+          onInterrupt={handleInterrupt}
+          isSpeaking={isSpeaking}
+        />
+        <ChatContainer messages={messages} isLoading={isLoading} />
+        <InputBar
+          value={input}
+          onChange={setInput}
+          onSend={() => handleSend(input)}
+          onVoiceToggle={toggleVoiceMode}
+          isVoiceMode={isVoiceMode}
+          isListening={isListening}
+          isLoading={isLoading}
+          onStopListening={stopListening}
+        />
+      </main>
+      {isVoiceMode && (
+        <VoiceOverlay
+          isListening={isListening}
+          isSpeaking={isSpeaking}
+          onClose={() => { handleInterrupt(); setVoiceMode(false); }}
+          onInterrupt={handleInterrupt}
+        />
+      )}
+    </div>
+  );
+}
+'@ | Set-Content "$BaseDir\frontend\src\app\page.tsx" -Encoding UTF8
+Write-Host "✓ src/app/page.tsx" -ForegroundColor Green
+# ─── NEXT-ENV.D.TS ───
+@'
+/// <reference types="next" />
+/// <reference types="next/image-types/global" />
+'@ | Set-Content "$BaseDir\frontend\next-env.d.ts" -Encoding UTF8
+Write-Host "✓ next-env.d.ts" -ForegroundColor Green
+# ─── UPDATE START.PS1 (Add frontend) ───
+@'
+# ═══════════════════════════════════════════════════════════════════════════════
+# KNIGHTBOT - Complete Startup Script
+# ═══════════════════════════════════════════════════════════════════════════════
+param([switch]$SkipDocker, [switch]$SkipFrontend)
+$ErrorActionPreference = "Continue"
+$KnightDir = "F:\KnightBot"
+Clear-Host
+Write-Host @"
+  ██╗  ██╗███╗   ██╗██╗ ██████╗ ██╗  ██╗████████╗
+  ██║ ██╔╝████╗  ██║██║██╔════╝ ██║  ██║╚══██╔══╝
+  █████╔╝ ██╔██╗ ██║██║██║  ███╗███████║   ██║
+  ██╔═██╗ ██║╚██╗██║██║██║   ██║██╔══██║   ██║
+  ██║  ██╗██║ ╚████║██║╚██████╔╝██║  ██║   ██║
+  ╚═╝  ╚═╝╚═╝  ╚═══╝╚═╝ ╚═════╝ ╚═╝  ╚═╝   ╚═╝
+  Ultimate Voice Bridge - Starting Up...
+"@ -ForegroundColor Cyan
+# Docker services
+if (-not $SkipDocker) {
+    Write-Host "[1/6] Starting Docker services (Qdrant + Mem0)..." -ForegroundColor Yellow
+    Set-Location $KnightDir
+    docker-compose up -d 2>$null
+    Start-Sleep -Seconds 8
+    Write-Host "      ✓ Docker services started" -ForegroundColor Green
+} else {
+    Write-Host "[1/6] Skipping Docker" -ForegroundColor DarkGray
+}
+# Check LM Studio
+Write-Host "[2/6] Checking LM Studio..." -ForegroundColor Yellow
+$lmStudio = Test-NetConnection -ComputerName localhost -Port 1234 -WarningAction SilentlyContinue
+if ($lmStudio.TcpTestSucceeded) {
+    Write-Host "      ✓ LM Studio detected on port 1234" -ForegroundColor Green
+} else {
+    Write-Host "      ⚠ LM Studio not running - start it and load a model" -ForegroundColor Yellow
+}
+# Knight API
+Write-Host "[3/6] Starting Knight API server (port 8100)..." -ForegroundColor Yellow
+Start-Process powershell -ArgumentList "-NoExit", "-Command", "cd '$KnightDir\scripts'; python knight_core.py" -WindowStyle Minimized
+Start-Sleep -Seconds 3
+Write-Host "      ✓ Knight API starting" -ForegroundColor Green
+# Parakeet STT
+Write-Host "[4/6] Starting Parakeet STT (port 8070)..." -ForegroundColor Yellow
+Start-Process powershell -ArgumentList "-NoExit", "-Command", "cd '$KnightDir\parakeet'; python server.py" -WindowStyle Minimized
+Start-Sleep -Seconds 2
+Write-Host "      ✓ Parakeet STT starting" -ForegroundColor Green
+# Chatterbox TTS
+Write-Host "[5/6] Starting Chatterbox TTS (port 8060)..." -ForegroundColor Yellow
+Start-Process powershell -ArgumentList "-NoExit", "-Command", "cd '$KnightDir\chatterbox'; python server.py" -WindowStyle Minimized
+Start-Sleep -Seconds 2
+Write-Host "      ✓ Chatterbox TTS starting" -ForegroundColor Green
+# Frontend
+if (-not $SkipFrontend) {
+    Write-Host "[6/6] Starting Frontend (port 3000)..." -ForegroundColor Yellow
+    Start-Process powershell -ArgumentList "-NoExit", "-Command", "cd '$KnightDir\frontend'; npm run dev" -WindowStyle Minimized
+    Write-Host "      ✓ Frontend starting" -ForegroundColor Green
+} else {
+    Write-Host "[6/6] Skipping Frontend" -ForegroundColor DarkGray
+}
+# Wait for services
+Write-Host "`nWaiting for services to initialize..." -ForegroundColor Cyan
+Start-Sleep -Seconds 5
+# Status
+Write-Host "`n═══════════════════════════════════════════════════════════" -ForegroundColor Cyan
+Write-Host "  KNIGHTBOT STATUS" -ForegroundColor Cyan
+Write-Host "═══════════════════════════════════════════════════════════" -ForegroundColor Cyan
+Write-Host ""
+Write-Host "  Frontend:    http://localhost:3000" -ForegroundColor White
+Write-Host "  Knight API:  http://localhost:8100" -ForegroundColor White
+Write-Host "  STT Server:  http://localhost:8070" -ForegroundColor White
+Write-Host "  TTS Server:  http://localhost:8060" -ForegroundColor White
+Write-Host "  Qdrant:      http://localhost:6333" -ForegroundColor White
+Write-Host "  Mem0:        http://localhost:8050" -ForegroundColor White
+Write-Host "  LM Studio:   http://localhost:1234" -ForegroundColor White
+Write-Host ""
+Write-Host "  Shortcuts:" -ForegroundColor DarkGray
+Write-Host "    Ctrl+V  = Toggle voice mode" -ForegroundColor DarkGray
+Write-Host "    Escape  = Interrupt/stop" -ForegroundColor DarkGray
+Write-Host "    Space   = Stop recording (in voice mode)" -ForegroundColor DarkGray
+Write-Host ""
+Write-Host "═══════════════════════════════════════════════════════════" -ForegroundColor Cyan
+Write-Host ""
+# Open browser
+Start-Process "http://localhost:3000"
+'@ | Set-Content "$BaseDir\start.ps1" -Encoding UTF8
+Write-Host "✓ start.ps1 (updated with frontend)" -ForegroundColor Green
+# ─── STOP.PS1 (Complete shutdown) ───
+@'
+# ═══════════════════════════════════════════════════════════════════════════════
+# KNIGHTBOT - Complete Shutdown Script
+# ═══════════════════════════════════════════════════════════════════════════════
+Write-Host "`n🛑 Stopping KnightBot...`n" -ForegroundColor Yellow
+# Stop Node (frontend)
+Write-Host "  Stopping frontend..." -ForegroundColor DarkGray
+Get-Process node -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+# Stop Python servers
+Write-Host "  Stopping Python servers..." -ForegroundColor DarkGray
+Get-Process python -ErrorAction SilentlyContinue | Where-Object {
+    $_.Path -like "*KnightBot*" -or $_.MainWindowTitle -like "*knight*"
+} | Stop-Process -Force -ErrorAction SilentlyContinue
+# Stop Docker
+Write-Host "  Stopping Docker services..." -ForegroundColor DarkGray
+Set-Location "F:\KnightBot"
+docker-compose down 2>$null
+Write-Host "`n✓ KnightBot stopped`n" -ForegroundColor Green
+'@ | Set-Content "$BaseDir\stop.ps1" -Encoding UTF8
+Write-Host "✓ stop.ps1 (updated)" -ForegroundColor Green
+# ─── INSTALL.PS1 (First-time setup) ───
+@'
+# ═══════════════════════════════════════════════════════════════════════════════
+# KNIGHTBOT - First-Time Installation
+# Run this ONCE after running all setup scripts
+# ═══════════════════════════════════════════════════════════════════════════════
+$ErrorActionPreference = "Stop"
+$KnightDir = "F:\KnightBot"
+Write-Host "`n🛡️ KNIGHTBOT INSTALLATION`n" -ForegroundColor Cyan
+# Check Python
+Write-Host "[1/4] Checking Python..." -ForegroundColor Yellow
+try {
+    $pyVersion = python --version 2>&1
+    Write-Host "      ✓ $pyVersion" -ForegroundColor Green
+} catch {
+    Write-Host "      ✗ Python not found. Install Python 3.10+ first." -ForegroundColor Red
+    exit 1
+}
+# Check Node
+Write-Host "[2/4] Checking Node.js..." -ForegroundColor Yellow
+try {
+    $nodeVersion = node --version 2>&1
+    Write-Host "      ✓ Node $nodeVersion" -ForegroundColor Green
+} catch {
+    Write-Host "      ✗ Node.js not found. Install Node 18+ first." -ForegroundColor Red
+    exit 1
+}
+# Install Python dependencies
+Write-Host "[3/4] Installing Python dependencies..." -ForegroundColor Yellow
+Set-Location $KnightDir
+pip install -r requirements.txt --quiet
+Write-Host "      ✓ Python dependencies installed" -ForegroundColor Green
+# Install Node dependencies
+Write-Host "[4/4] Installing frontend dependencies..." -ForegroundColor Yellow
+Set-Location "$KnightDir\frontend"
+npm install --silent
+Write-Host "      ✓ Frontend dependencies installed" -ForegroundColor Green
+Write-Host "`n═══════════════════════════════════════════════════════════" -ForegroundColor Cyan
+Write-Host "  ✓ INSTALLATION COMPLETE" -ForegroundColor Green
+Write-Host "═══════════════════════════════════════════════════════════" -ForegroundColor Cyan
+Write-Host "`nNext steps:"
+Write-Host "  1. Start LM Studio and load your preferred model"
+Write-Host "  2. Run: .\start.ps1"
+Write-Host "  3. Open: http://localhost:3000`n"
+'@ | Set-Content "$BaseDir\install.ps1" -Encoding UTF8
+Write-Host "✓ install.ps1" -ForegroundColor Green
+# ─── README.MD ───
+@'
+# KnightBot - Ultimate Voice Bridge
+Your sharp-witted AI companion with voice capabilities.
+## Quick Start
+```powershell
+# First time only:
+.\install.ps1
+# Start everything:
+.\start.ps1
+# Stop everything:
+.\stop.ps1
+Read-Host "Press Enter to exit"
