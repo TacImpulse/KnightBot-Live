@@ -5,7 +5,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from pathlib import Path
 from datetime import datetime
-import httpx, os, json
+import httpx, os
 from livekit import api
 
 # Load env

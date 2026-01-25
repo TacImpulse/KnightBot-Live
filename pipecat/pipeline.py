@@ -3,9 +3,6 @@
 import asyncio
 import httpx
 import struct
-import json
-from datetime import datetime
-from livekit import api
 from pipecat.pipeline.pipeline import Pipeline
 from pipecat.pipeline.task import PipelineTask, PipelineParams
 from pipecat.frames.frames import Frame, AudioRawFrame, TextFrame, TranscriptionFrame

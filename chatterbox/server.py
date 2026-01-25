@@ -17,6 +17,7 @@ import transformers
 from transformers import LlamaConfig
 from chatterbox import ChatterboxTTS
 from PIL import Image
+import shutil
 
 # REVERTED to the state where we just DISABLE SDPA completely.
 # The "Invalid backend" error we saw earlier was likely because we tried to set env var "0" AND context manager.
