@@ -4,11 +4,26 @@ import subprocess
 import tempfile
 import traceback
 import uvicorn
-import nemo.collections.asr as nemo_asr
+import sys
+# NOTE: Importing `nemo.collections.asr` triggers a large dependency chain (pyannote,
+# etc.) that isn't required for running Parakeet inference. Import the ASRModel
+# class directly to keep runtime deps lighter on Windows.
+from nemo.collections.asr.models.asr_model import ASRModel
 from pathlib import Path
 from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from contextlib import asynccontextmanager
+
+
+def _configure_stdio_safely() -> None:
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(errors="replace")
+        except Exception:
+            pass
+
+
+_configure_stdio_safely()
 
 model, device = None, None
 
@@ -20,7 +35,7 @@ async def lifespan(app: FastAPI):
     if torch.cuda.is_available():
         print(f"   GPU: {torch.cuda.get_device_name(0)}")
     try:
-        model = nemo_asr.models.ASRModel.from_pretrained("nvidia/parakeet-tdt-0.6b-v2")
+        model = ASRModel.from_pretrained("nvidia/parakeet-tdt-0.6b-v2")
         model = model.to(device).eval()
         
         # Disable lhotse to avoid version mismatch errors

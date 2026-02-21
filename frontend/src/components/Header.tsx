@@ -5,7 +5,7 @@ import { useState, useEffect } from 'react';
 import { checkHealth } from '@/lib/api';
 interface Props { onMenuClick: () => void; onInterrupt: () => void; isSpeaking: boolean; }
 export function Header({ onMenuClick, onInterrupt, isSpeaking }: Props) {
-  const { isMuted, setMuted } = useStore();
+  const { isMuted, setMuted, setSettingsOpen } = useStore();
   const [health, setHealth] = useState({ knight: false, stt: false, tts: false });
   useEffect(() => {
     const check = async () => setHealth(await checkHealth());
@@ -46,7 +46,7 @@ export function Header({ onMenuClick, onInterrupt, isSpeaking }: Props) {
         <button onClick={() => setMuted(!isMuted)} className={`p-2 rounded-lg ${isMuted ? 'bg-knight-orange/20 text-knight-orange' : 'hover:bg-knight-border'}`}>
           {isMuted ? <VolumeX className="w-5 h-5" /> : <Volume2 className="w-5 h-5" />}
         </button>
-        <button onClick={() => useStore.getState().setSettingsOpen(true)} className="p-2 hover:bg-knight-border rounded-lg"><Settings className="w-5 h-5" /></button>
+        <button onClick={() => setSettingsOpen(true)} className="p-2 hover:bg-knight-border rounded-lg"><Settings className="w-5 h-5" /></button>
       </div>
     </header>
   );

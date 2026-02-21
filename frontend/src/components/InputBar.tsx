@@ -1,14 +1,28 @@
 'use client';
 import { useRef, useEffect } from 'react';
 import { Send, Mic, MicOff, Paperclip, X } from 'lucide-react';
+import { VOICE_RESPONSE_OPTIONS, type VoiceResponseMode } from '@/lib/voiceProfiles';
 
 interface Props {
   value: string; onChange: (v: string) => void; onSend: () => void;
   onVoiceToggle: () => void; isVoiceMode: boolean; isListening: boolean;
-  isLoading: boolean; onStopListening: () => void;
+  isLoading: boolean;
   selectedFile: File | null; onFileSelect: (f: File | null) => void;
+  voiceResponseMode: VoiceResponseMode; onVoiceResponseModeChange: (mode: VoiceResponseMode) => void;
 }
-export function InputBar({ value, onChange, onSend, onVoiceToggle, isVoiceMode, isListening, isLoading, onStopListening, selectedFile, onFileSelect }: Props) {
+export function InputBar({
+  value,
+  onChange,
+  onSend,
+  onVoiceToggle,
+  isVoiceMode,
+  isListening,
+  isLoading,
+  selectedFile,
+  onFileSelect,
+  voiceResponseMode,
+  onVoiceResponseModeChange,
+}: Props) {
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
 
@@ -43,7 +57,18 @@ export function InputBar({ value, onChange, onSend, onVoiceToggle, isVoiceMode, 
       <div className="max-w-3xl mx-auto">
         {selectedFile && (
           <div className="mb-2 flex items-center gap-2 bg-knight-surface border border-knight-border rounded-lg px-3 py-2 w-fit">
-            <span className="text-sm text-knight-text truncate max-w-[200px]">{selectedFile.name}</span>
+            {selectedFile.type.startsWith('image/') ? (
+              <div className="flex items-center gap-2">
+                <img 
+                  src={URL.createObjectURL(selectedFile)} 
+                  alt="Preview" 
+                  className="w-16 h-16 object-cover rounded-lg"
+                />
+                <span className="text-sm text-knight-text truncate max-w-[150px]">{selectedFile.name}</span>
+              </div>
+            ) : (
+              <span className="text-sm text-knight-text truncate max-w-[200px]">{selectedFile.name}</span>
+            )}
             <button onClick={clearFile} className="p-1 hover:bg-knight-border rounded-full text-knight-muted hover:text-red-400">
               <X className="w-3 h-3" />
             </button>
@@ -75,10 +100,10 @@ export function InputBar({ value, onChange, onSend, onVoiceToggle, isVoiceMode, 
             disabled={isLoading || isVoiceMode}
           />
           <button
-            onClick={isListening ? onStopListening : onVoiceToggle}
+            onClick={onVoiceToggle}
             className={`p-2 rounded-xl transition-all ${isVoiceMode || isListening ? 'bg-knight-orange text-white shadow-lg shadow-knight-orange/30' : 'hover:bg-knight-border text-knight-muted hover:text-knight-text'}`}
           >
-            {isListening ? <MicOff className="w-5 h-5" /> : <Mic className="w-5 h-5" />}
+            {isVoiceMode ? <MicOff className="w-5 h-5" /> : <Mic className="w-5 h-5" />}
           </button>
           <button
             onClick={onSend}
@@ -88,7 +113,33 @@ export function InputBar({ value, onChange, onSend, onVoiceToggle, isVoiceMode, 
             <Send className="w-5 h-5" />
           </button>
         </div>
-        <p className="text-center text-xs text-knight-muted mt-2">Press Enter to send · Shift+Enter for new line · Ctrl+V for voice</p>
+        <div className="mt-2 flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
+          <div className="flex items-center gap-2">
+            <label htmlFor="voice-response-mode" className="text-xs text-knight-muted uppercase tracking-wide">
+              Voice Reply
+            </label>
+            <select
+              id="voice-response-mode"
+              value={voiceResponseMode}
+              onChange={(e) => onVoiceResponseModeChange(e.target.value as VoiceResponseMode)}
+              className="bg-knight-surface border border-knight-border rounded-lg px-2 py-1 text-xs text-knight-text outline-none focus:border-knight-cyan"
+              title={VOICE_RESPONSE_OPTIONS.find((m) => m.value === voiceResponseMode)?.description || ''}
+              disabled={isLoading}
+            >
+              {VOICE_RESPONSE_OPTIONS.map((mode) => (
+                <option key={mode.value} value={mode.value} title={mode.description}>
+                  {mode.label}
+                </option>
+              ))}
+            </select>
+            <span className="hidden md:inline text-[11px] text-knight-muted">
+              {VOICE_RESPONSE_OPTIONS.find((m) => m.value === voiceResponseMode)?.description}
+            </span>
+          </div>
+          <p className="text-center text-xs text-knight-muted">
+            Press Enter to send · Shift+Enter for new line · Ctrl+V for voice
+          </p>
+        </div>
       </div>
     </div>
   );

@@ -1,15 +1,45 @@
+import type { BackendVoiceProfile } from './voiceProfiles';
+
 const KNIGHT_API = '/api/knight';
 const STT_API = '/api/stt';
 const TTS_API = '/api/tts';
 
-export async function sendMessage(message: string, voiceId?: string, systemPrompt?: string, images?: string[]) {
-  const r = await fetch(`${KNIGHT_API}/chat`, { 
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' }, 
-    body: JSON.stringify({ message, voice_id: voiceId, system_prompt: systemPrompt, images }) 
-  });
-  if (!r.ok) throw new Error(await r.text());
-  return r.json();
+export async function sendMessage(
+  message: string,
+  voiceId?: string,
+  systemPrompt?: string,
+  images?: string[],
+  includeAudio: boolean = false,
+  voiceProfile?: BackendVoiceProfile,
+  timeoutMs: number = 300000
+) {
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
+  
+  try {
+    const r = await fetch(`${KNIGHT_API}/chat`, { 
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' }, 
+      body: JSON.stringify({
+        message,
+        voice_id: voiceId,
+        system_prompt: systemPrompt,
+        images,
+        include_audio: includeAudio,
+        voice_profile: voiceProfile,
+      }),
+      signal: controller.signal
+    });
+    clearTimeout(timeoutId);
+    if (!r.ok) throw new Error(await r.text());
+    return r.json();
+  } catch (error) {
+    clearTimeout(timeoutId);
+    if (error instanceof Error && error.name === 'AbortError') {
+      throw new Error('Request timed out. The model may be taking too long to respond.');
+    }
+    throw error;
+  }
 }
 
 export async function synthesizeSpeech(text: string, exaggeration = 0.5, voiceId?: string): Promise<Blob> {
@@ -83,7 +113,17 @@ export async function getLiveKitToken(roomName: string, participantName: string)
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ room_name: roomName, participant_name: participantName })
   });
-  if (!r.ok) throw new Error('Failed to get LiveKit token');
+  if (!r.ok) {
+    // Preserve server-provided error details to make debugging easier.
+    let details = '';
+    try {
+      details = await r.text();
+    } catch {
+      details = '';
+    }
+    const msg = details?.trim() ? `Failed to get LiveKit token: ${details}` : 'Failed to get LiveKit token';
+    throw new Error(msg);
+  }
   return r.json();
 }
 

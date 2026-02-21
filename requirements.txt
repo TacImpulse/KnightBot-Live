@@ -25,6 +25,14 @@ librosa
 faster-whisper
 scipy
 
+# Parakeet STT (NeMo)
+nemo-toolkit>=2.0.0
+
+# Chatterbox TTS
+transformers>=4.40.0
+pydub>=0.25.1
+python-multipart>=0.0.9
+
 # LiveKit / Pipecat
 livekit>=0.9.0
 livekit-api>=0.4.0

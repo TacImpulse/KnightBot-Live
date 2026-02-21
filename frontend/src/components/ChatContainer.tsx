@@ -2,8 +2,14 @@
 import { useRef, useEffect } from 'react';
 import { Message } from '@/lib/store';
 import { ChatMessage } from './ChatMessage';
-interface Props { messages: Message[]; isLoading: boolean; onSuggestionClick: (text: string) => void; }
-export function ChatContainer({ messages, isLoading, onSuggestionClick }: Props) {
+interface Props { 
+  messages: Message[]; 
+  isLoading: boolean; 
+  onSuggestionClick: (text: string) => void; 
+  onResubmit?: (content: string, messageId: string) => void;
+  onBranch?: (messageId: string) => void;
+}
+export function ChatContainer({ messages, isLoading, onSuggestionClick, onResubmit, onBranch }: Props) {
   const bottomRef = useRef<HTMLDivElement>(null);
   useEffect(() => {
     bottomRef.current?.scrollIntoView({ behavior: 'smooth' });
@@ -33,8 +39,15 @@ export function ChatContainer({ messages, isLoading, onSuggestionClick }: Props)
     );
   }
   return (
-    <div className="flex-1 overflow-y-auto p-4 space-y-4">
-      {messages.map(m => <ChatMessage key={m.id} message={m} />)}
+    <div className="flex-1 overflow-y-auto p-4 space-y-6 pb-20">
+      {messages.map(m => (
+        <ChatMessage 
+          key={m.id} 
+          message={m} 
+          onResubmit={onResubmit}
+          onBranch={onBranch}
+        />
+      ))}
       {isLoading && (
         <div className="flex gap-3 max-w-3xl mx-auto">
           <div className="w-8 h-8 rounded-full bg-gradient-to-br from-knight-cyan to-knight-purple flex items-center justify-center flex-shrink-0">

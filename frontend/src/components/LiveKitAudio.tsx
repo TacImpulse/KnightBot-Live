@@ -3,8 +3,8 @@
 import { LiveKitRoom, RoomAudioRenderer, useLocalParticipant, useVoiceAssistant, BarVisualizer, useRoomContext } from "@livekit/components-react";
 import { useEffect, useState, useRef } from "react";
 import "@livekit/components-styles";
-import { X, Mic, MicOff, Settings, Upload, Activity, Maximize2, Minimize2, GripHorizontal, Trash2, Check, User, Image as ImageIcon, Edit2, PlayCircle } from "lucide-react";
-import { getLiveKitToken, uploadVoice, getVoices, deleteVoice, uploadAvatar, renameVoice, selectVoice } from "@/lib/api";
+import { X, Mic, MicOff, Settings, Activity, Maximize2, Minimize2, GripHorizontal } from "lucide-react";
+import { getLiveKitToken } from "@/lib/api";
 import { useStore } from "@/lib/store";
 import { RoomEvent } from "livekit-client";
 
@@ -15,11 +15,14 @@ interface Props {
 export default function LiveKitAudio({ onClose }: Props) {
   const [token, setToken] = useState("");
   const [url, setUrl] = useState("");
+  const [error, setError] = useState<string | null>(null);
+  const [isLoading, setIsLoading] = useState(true);
   const [isMinimized, setIsMinimized] = useState(false);
   const [position, setPosition] = useState({ x: 0, y: 0 });
   const [isDragging, setIsDragging] = useState(false);
   const [dragOffset, setDragOffset] = useState({ x: 0, y: 0 });
   const containerRef = useRef<HTMLDivElement>(null);
+  const { setSettingsOpen } = useStore();
 
   const handleMouseDown = (e: React.MouseEvent) => {
     if (containerRef.current && (e.target as HTMLElement).closest('.drag-handle')) {
@@ -53,16 +56,80 @@ export default function LiveKitAudio({ onClose }: Props) {
   useEffect(() => {
     // Set initial position
     setPosition({ x: 16, y: 16 });
-    (async () => {
+
+    let cancelled = false;
+    let retryCount = 0;
+    const maxRetries = 3;
+    let retryTimer: ReturnType<typeof setTimeout> | null = null;
+
+    const connect = async () => {
       try {
-        const data = await getLiveKitToken("knight-room", "user-" + Math.floor(Math.random() * 1000));
+        if (cancelled) return;
+        setIsLoading(true);
+        setError(null);
+
+        const data = await getLiveKitToken(
+          "knight-room",
+          "user-" + Math.floor(Math.random() * 1000)
+        );
+
+        if (!data?.token || !data?.url) {
+          throw new Error("Invalid token response from server");
+        }
+        if (cancelled) return;
+
         setToken(data.token);
         setUrl(data.url);
-      } catch (e) {
+        setIsLoading(false);
+      } catch (e: any) {
+        if (cancelled) return;
         console.error("Failed to get token", e);
+
+        if (retryCount < maxRetries) {
+          retryCount++;
+          console.log(`Retrying connection (${retryCount}/${maxRetries})...`);
+          retryTimer = setTimeout(connect, 2000); // Retry after 2s
+        } else {
+          setError(e?.message || "Failed to initialize voice connection");
+          setIsLoading(false);
+        }
       }
-    })();
+    };
+
+    connect();
+
+    return () => {
+      cancelled = true;
+      if (retryTimer) clearTimeout(retryTimer);
+    };
   }, []);
+
+  if (isLoading) {
+    return (
+      <div className="fixed bottom-4 right-4 bg-knight-surface border border-knight-border rounded-xl p-4 shadow-lg z-50 flex items-center gap-3">
+        <Activity className="w-5 h-5 text-knight-cyan animate-spin" />
+        <div className="text-knight-text text-sm">Initializing Neural Link...</div>
+      </div>
+    );
+  }
+
+  if (error) {
+    return (
+      <div className="fixed bottom-4 right-4 bg-red-900/30 border border-red-500/50 rounded-xl p-4 shadow-lg z-50 flex flex-col gap-2 max-w-xs">
+        <div className="flex items-center gap-2 text-red-400 font-semibold">
+          <X className="w-5 h-5" />
+          <span>Neural Link Failed</span>
+        </div>
+        <div className="text-red-200/80 text-sm">{error}</div>
+        <button
+          onClick={onClose}
+          className="mt-1 px-3 py-1 bg-red-500/20 hover:bg-red-500/30 text-red-300 rounded-lg text-sm transition-colors"
+        >
+          Close
+        </button>
+      </div>
+    );
+  }
 
   if (!token || !url) {
     return (
@@ -132,9 +199,13 @@ function ChatSyncHandler() {
         const str = new TextDecoder().decode(payload);
         const data = JSON.parse(str);
 
-        if (data.type === 'chat') {
+        // Be defensive: LiveKit data packets may include non-chat payloads.
+        if (!data || typeof data !== 'object') return;
+        if ((data as any).type !== 'chat') return;
+
+        {
           // Prevent duplicate messages if any (simple timestamp check)
-          const key = `${data.timestamp}-${data.content}`;
+          const key = `${(data as any).timestamp}-${(data as any).content}`;
           if (processedMessages.current.has(key)) return;
           processedMessages.current.add(key);
 
@@ -146,8 +217,8 @@ function ChatSyncHandler() {
 
           addMessage({
             id: Date.now().toString(),
-            role: data.role,
-            content: data.content,
+            role: (data as any).role,
+            content: (data as any).content,
             timestamp: new Date()
           });
         }
@@ -179,225 +250,13 @@ function MinimizedState() {
 function VisualizerState() {
   const { state, audioTrack } = useVoiceAssistant();
   const { isMicrophoneEnabled, localParticipant } = useLocalParticipant();
-  const [showSettings, setShowSettings] = useState(false);
-  const fileInputRef = useRef<HTMLInputElement>(null);
-  const avatarInputRef = useRef<HTMLInputElement>(null);
-  const [voices, setVoices] = useState<string[]>([]);
-  const [selectedVoice, setSelectedVoice] = useState<string | null>(null);
-  const [editingVoice, setEditingVoice] = useState<string | null>(null);
-  const [editName, setEditName] = useState("");
-  const [avatarUploadVoice, setAvatarUploadVoice] = useState<string | null>(null);
-
-  useEffect(() => {
-    if (showSettings) {
-      loadVoices();
-    }
-  }, [showSettings]);
-
-  const loadVoices = async () => {
-    const v = await getVoices();
-    setVoices(v.voices);
-    setSelectedVoice(v.default);
-  };
-
-  const handleUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
-    if (e.target.files?.[0]) {
-      try {
-        const file = e.target.files[0];
-        const name = prompt("Name this voice profile:", file.name.replace('.wav', ''));
-        if (!name) return;
-
-        await uploadVoice(file, name);
-        await loadVoices();
-        alert("Voice uploaded! Restarting Knight's vocal cords...");
-      } catch (err) {
-        alert("Failed to upload voice");
-      }
-    }
-  };
-
-  const handleAvatarUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
-    if (e.target.files?.[0] && avatarUploadVoice) {
-      try {
-        await uploadAvatar(avatarUploadVoice, e.target.files[0]);
-        // Force refresh of image by appending timestamp or just reload list (though list doesn't have image url, component constructs it)
-        // We'll just force a re-render or let the user see it on next load. 
-        // A simple way to refresh the image is to update a key or state, but since we use direct URL, browser caching might be an issue.
-        // We can append ?t=Date.now() to the image src.
-        setAvatarUploadVoice(null);
-        await loadVoices(); // Refresh list
-      } catch (err) {
-        alert("Failed to upload avatar");
-      }
-    }
-  };
-
-  const handleRename = async (voice: string) => {
-    if (!editName.trim() || editName === voice) {
-      setEditingVoice(null);
-      return;
-    }
-    try {
-      await renameVoice(voice, editName);
-      await loadVoices();
-      setEditingVoice(null);
-    } catch (err) {
-      alert("Failed to rename voice");
-    }
-  };
-
-  const startEditing = (voice: string) => {
-    setEditingVoice(voice);
-    setEditName(voice);
-  };
-
-  const handleDelete = async (voice: string) => {
-    if (confirm(`Delete voice profile '${voice}'?`)) {
-      try {
-        await deleteVoice(voice);
-        await loadVoices();
-      } catch (err) {
-        alert("Failed to delete voice");
-      }
-    }
-  };
-
-  const triggerAvatarUpload = (voice: string) => {
-    setAvatarUploadVoice(voice);
-    avatarInputRef.current?.click();
-  };
-
-  if (showSettings) {
-    return (
-      <div className="flex flex-col h-full p-6">
-        <div className="flex justify-between items-center mb-6">
-          <h3 className="text-xl font-bold text-white">Voice Settings</h3>
-          <button onClick={() => setShowSettings(false)} className="text-knight-muted hover:text-white">Back</button>
-        </div>
-
-        <input
-          type="file"
-          accept="image/*"
-          ref={avatarInputRef}
-          className="hidden"
-          onChange={handleAvatarUpload}
-        />
-
-        <div className="space-y-6 overflow-y-auto pr-2 flex-1">
-          {/* Upload Section */}
-          <div className="bg-knight-surface p-4 rounded-lg border border-knight-border">
-            <h4 className="text-sm font-medium text-knight-muted mb-3">Cloning Lab</h4>
-            <p className="text-xs text-knight-muted mb-4">Upload a 10-20s clean WAV file to clone a new voice.</p>
-
-            <input
-              type="file"
-              accept=".wav"
-              ref={fileInputRef}
-              className="hidden"
-              onChange={handleUpload}
-            />
-
-            <button
-              onClick={() => fileInputRef.current?.click()}
-              className="flex items-center justify-center gap-2 w-full py-3 bg-knight-border hover:bg-knight-purple/20 border border-knight-border rounded-lg transition-all"
-            >
-              <Upload className="w-4 h-4" />
-              <span>Upload Voice Sample</span>
-            </button>
-          </div>
-
-          {/* Voice Profiles */}
-          <div className="bg-knight-surface p-4 rounded-lg border border-knight-border">
-            <h4 className="text-sm font-medium text-knight-muted mb-3">Voice Profiles</h4>
-            <div className="space-y-3">
-              {voices.map(voice => (
-                <div key={voice} className="flex items-center justify-between p-3 rounded bg-knight-bg/50 border border-knight-border/30 hover:border-knight-cyan/30 transition-all group">
-                  <div className="flex items-center gap-3 flex-1">
-                    {/* Avatar */}
-                    <div className="relative w-10 h-10 shrink-0">
-                      <img
-                        src={`/api/tts/voices/${voice}/avatar?t=${Date.now()}`}
-                        alt={voice}
-                        className="w-full h-full rounded-full object-cover bg-knight-surface border border-knight-border"
-                        onError={(e) => {
-                          (e.target as HTMLImageElement).src = 'data:image/svg+xml,<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="gray" stroke-width="2"><circle cx="12" cy="8" r="4"/><path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"/></svg>';
-                        }}
-                      />
-                      <button
-                        onClick={() => triggerAvatarUpload(voice)}
-                        className="absolute -bottom-1 -right-1 p-1 bg-knight-surface rounded-full border border-knight-border hover:border-knight-cyan text-knight-muted hover:text-knight-cyan opacity-0 group-hover:opacity-100 transition-opacity"
-                      >
-                        <ImageIcon className="w-3 h-3" />
-                      </button>
-                    </div>
-
-                    {/* Name / Edit Input */}
-                    {editingVoice === voice ? (
-                      <div className="flex items-center gap-2 flex-1">
-                        <input
-                          value={editName}
-                          onChange={(e) => setEditName(e.target.value)}
-                          className="bg-knight-bg border border-knight-cyan text-sm px-2 py-1 rounded w-full outline-none text-white"
-                          autoFocus
-                          onKeyDown={(e) => e.key === 'Enter' && handleRename(voice)}
-                        />
-                        <button onClick={() => handleRename(voice)} className="text-green-400 hover:text-green-300"><Check className="w-4 h-4" /></button>
-                        <button onClick={() => setEditingVoice(null)} className="text-red-400 hover:text-red-300"><X className="w-4 h-4" /></button>
-                      </div>
-                    ) : (
-                      <div className="flex flex-col">
-                        <span className={`text-sm font-medium ${voice === selectedVoice ? 'text-knight-cyan' : 'text-white'}`}>
-                          {voice} {voice === selectedVoice && '(Active)'}
-                        </span>
-                      </div>
-                    )}
-                  </div>
-
-                  {/* Actions */}
-                  {editingVoice !== voice && (
-                    <div className="flex gap-1 opacity-0 group-hover:opacity-100 transition-opacity ml-2">
-                      {voice !== selectedVoice && (
-                        <button
-                          onClick={() => handleSelect(voice)}
-                          className="p-1.5 hover:bg-knight-cyan/20 rounded text-knight-muted hover:text-knight-cyan"
-                          title="Select Active Voice"
-                        >
-                          <PlayCircle className="w-3.5 h-3.5" />
-                        </button>
-                      )}
-                      <button
-                        onClick={() => startEditing(voice)}
-                        className="p-1.5 hover:bg-knight-border/50 rounded text-knight-muted hover:text-white"
-                        title="Rename"
-                      >
-                        <Edit2 className="w-3.5 h-3.5" />
-                      </button>
-                      <button
-                        onClick={() => handleDelete(voice)}
-                        className="p-1.5 hover:bg-red-500/20 rounded text-knight-muted hover:text-red-400"
-                        title="Delete"
-                      >
-                        <Trash2 className="w-3.5 h-3.5" />
-                      </button>
-                    </div>
-                  )}
-                </div>
-              ))}
-              {voices.length === 0 && (
-                <p className="text-xs text-knight-muted italic text-center py-2">No custom voices found</p>
-              )}
-            </div>
-          </div>
-        </div>
-      </div>
-    );
-  }
+  const { setSettingsOpen } = useStore();
 
   return (
     <div className="flex flex-col items-center justify-center h-full gap-8 p-6 relative">
       <div className="absolute top-4 left-4">
         <button
-          onClick={() => setShowSettings(true)}
+          onClick={() => setSettingsOpen(true)}
           className="p-2 hover:bg-knight-border rounded-full text-knight-muted hover:text-white transition-colors"
         >
           <Settings className="w-5 h-5" />
