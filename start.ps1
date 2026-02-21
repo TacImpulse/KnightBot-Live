@@ -52,6 +52,68 @@ function Start-KnightService {
     Write-Host ("  OK: " + $Name + " launch command issued (PID " + $proc.Id + ")") -ForegroundColor Green
 }
 
+function Get-DotEnvValue {
+    param(
+        [Parameter(Mandatory = $true)][string]$Path,
+        [Parameter(Mandatory = $true)][string]$Key,
+        [Parameter(Mandatory = $true)][string]$Default
+    )
+
+    if (-not (Test-Path $Path)) { return $Default }
+    try {
+        $line = Get-Content $Path -ErrorAction Stop |
+            Where-Object { $_ -match ("^\s*" + [regex]::Escape($Key) + "\s*=") } |
+            Select-Object -Last 1
+        if (-not $line) { return $Default }
+
+        $value = ($line -split "=", 2)[1].Trim()
+        if (($value.StartsWith("'") -and $value.EndsWith("'")) -or ($value.StartsWith('"') -and $value.EndsWith('"'))) {
+            $value = $value.Substring(1, $value.Length - 2)
+        }
+        if ([string]::IsNullOrWhiteSpace($value)) { return $Default }
+        return $value
+    }
+    catch {
+        return $Default
+    }
+}
+
+function Stop-KnightCoreProcesses {
+    param([switch]$Quiet)
+
+    try {
+        $targets = Get-CimInstance Win32_Process -ErrorAction SilentlyContinue | Where-Object {
+            $_.Name -match '^python(w)?\.exe$' -and
+            $_.CommandLine -and
+            $_.CommandLine -match 'scripts[\\/]knight_core\.py'
+        }
+    }
+    catch {
+        $targets = @()
+    }
+
+    if (-not $targets -or $targets.Count -eq 0) {
+        if (-not $Quiet) {
+            Write-Host "No existing Knight Core python processes found." -ForegroundColor DarkGray
+        }
+        return 0
+    }
+
+    $stopped = 0
+    foreach ($t in $targets) {
+        try {
+            Stop-Process -Id $t.ProcessId -Force -ErrorAction Stop
+            $stopped++
+            Write-Host ("  OK: stopped stale Knight Core PID " + $t.ProcessId) -ForegroundColor DarkGray
+        }
+        catch {
+            Write-Host ("  WARN: failed to stop stale Knight Core PID " + $t.ProcessId + ": " + $_.Exception.Message) -ForegroundColor Yellow
+        }
+    }
+    Start-Sleep -Milliseconds 800
+    return $stopped
+}
+
 try {
     if ($Host -and $Host.UI -and $Host.UI.RawUI) {
         Clear-Host
@@ -72,6 +134,14 @@ if (-not (Test-Path $PythonExe)) {
 
 # Ensure we run from the repo root regardless of where the script was invoked from.
 Set-Location $K
+
+$dotEnvPath = Join-Path $K ".env"
+$lmReqTimeout = Get-DotEnvValue -Path $dotEnvPath -Key "LM_REQUEST_TIMEOUT_S" -Default "180"
+$lmFallbackModel = Get-DotEnvValue -Path $dotEnvPath -Key "LM_FALLBACK_MODEL_ID" -Default "phi-4-14b-instruct-sft"
+$lmForceNonStream = Get-DotEnvValue -Path $dotEnvPath -Key "LM_FORCE_NONSTREAM_MODELS" -Default "qwen3-vl-32b-instruct-heretic-v2-i1,qwen3-vl-32b-thinking-heretic-v2-i1"
+Write-Host ("LLM Runtime: timeout=" + $lmReqTimeout + "s") -ForegroundColor Cyan
+Write-Host ("LLM Runtime: fallback model=" + $lmFallbackModel) -ForegroundColor Cyan
+Write-Host ("LLM Runtime: forced non-stream models=" + $lmForceNonStream) -ForegroundColor Cyan
 
 # Stage LiveKit config to a C: path for Docker Desktop mounts.
 # Some Docker Desktop setups cannot bind-mount directly from external drives.
@@ -165,6 +235,12 @@ if ($ttsMissing.Count -gt 0) {
 $requiredPorts = @(3000, 8050, 8100, 7880, 6333)
 if (-not $skipTTS) { $requiredPorts += 8060 }
 if (-not $skipSTT) { $requiredPorts += @(8070, 8071) }
+
+# Enforce a single Knight Core owner before port checks.
+$stoppedKnightCore = Stop-KnightCoreProcesses -Quiet
+if ($stoppedKnightCore -gt 0) {
+    Write-Host ("Stopped " + $stoppedKnightCore + " existing Knight Core process(es) before launch.") -ForegroundColor Cyan
+}
 
 $occupied = @($requiredPorts | Where-Object { Test-PortInUse -Port $_ })
 if ($occupied.Count -gt 0) {

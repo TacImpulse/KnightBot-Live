@@ -52,6 +52,31 @@ function Stop-ProcessHard {
     }
 }
 
+function Stop-ProcessesByCommandPattern {
+    param(
+        [Parameter(Mandatory=$true)][string]$Pattern,
+        [Parameter(Mandatory=$true)][string]$Label
+    )
+
+    try {
+        $targets = Get-CimInstance Win32_Process -ErrorAction SilentlyContinue | Where-Object {
+            $_.Name -match '^python(w)?\.exe$' -and
+            $_.CommandLine -and
+            $_.CommandLine -match $Pattern
+        }
+    }
+    catch {
+        $targets = @()
+    }
+
+    if (-not $targets -or $targets.Count -eq 0) { return }
+
+    Write-Host ("Found " + $targets.Count + " extra " + $Label + " process(es) by command line; stopping...") -ForegroundColor DarkGray
+    foreach ($t in $targets) {
+        $null = Stop-ProcessHard -ProcessId $t.ProcessId -Reason "($Label commandline)"
+    }
+}
+
 function Invoke-DockerCompose {
     param(
         [Parameter(Mandatory=$true)][string[]]$Args
@@ -70,6 +95,9 @@ function Invoke-DockerCompose {
 }
 
 Write-Host "`nStopping KnightBot...`n" -ForegroundColor Yellow
+
+# Stop duplicate/non-listening Knight Core workers by commandline signature.
+Stop-ProcessesByCommandPattern -Pattern 'scripts[\\/]knight_core\.py' -Label "Knight Core"
 
 # Stop services by known listening ports (safer than killing all python/node)
 $ports = @(3000, 8060, 8070, 8071, 8100, 7880, 7881)

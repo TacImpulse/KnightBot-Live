@@ -8,13 +8,28 @@ from datetime import datetime
 import httpx, os, json, time, asyncio, re
 import sqlite3
 from typing import List, Dict, Any
+from contextlib import asynccontextmanager
 from livekit import api
 
 # Load env
 from dotenv import load_dotenv
 
 load_dotenv("F:/KnightBot/.env")
-app = FastAPI(title="KnightBot API")
+
+
+@asynccontextmanager
+async def app_lifespan(_: FastAPI):
+    init_local_memory_db()
+    nonstream_models = CONFIG.get("lm_force_nonstream_models", []) or []
+    nonstream_text = ", ".join(nonstream_models) if nonstream_models else "(none)"
+    print(f"[startup] LM request timeout: {float(CONFIG.get('lm_request_timeout_s', 180.0)):.0f}s")
+    print(f"[startup] LM fallback model: {CONFIG.get('lm_fallback_model_id', 'n/a')}")
+    print(f"[startup] LM forced non-stream models: {nonstream_text}")
+    asyncio.create_task(warmup_lm_model())
+    yield
+
+
+app = FastAPI(title="KnightBot API", lifespan=app_lifespan)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -58,11 +73,23 @@ CONFIG = {
     "vision_model_id": os.getenv(
         "VISION_MODEL_ID", "llama-joycaption-beta-one-hf-llava"
     ),
+    "lm_fallback_model_id": os.getenv("LM_FALLBACK_MODEL_ID", "phi-4-14b-instruct-sft"),
+    "lm_request_timeout_s": float(os.getenv("LM_REQUEST_TIMEOUT_S", "180")),
+    "lm_stream_enabled": os.getenv("LM_STREAM_ENABLED", "1").strip().lower()
+    in {"1", "true", "yes", "on"},
     "livekit_url": os.getenv("LIVEKIT_URL", "ws://localhost:7880"),
     "livekit_api_key": os.getenv("LIVEKIT_API_KEY", "devkey"),
     "livekit_api_secret": os.getenv("LIVEKIT_API_SECRET", "secret"),
 }
 CONFIG["lm_studio"] = (CONFIG["lm_studio"] or "http://192.168.68.111:1234/v1").strip().rstrip("/")
+CONFIG["lm_force_nonstream_models"] = [
+    m.strip().lower()
+    for m in os.getenv(
+        "LM_FORCE_NONSTREAM_MODELS",
+        "qwen3-vl-32b-instruct-heretic-v2-i1,qwen3-vl-32b-thinking-heretic-v2-i1",
+    ).split(",")
+    if m.strip()
+]
 SYSTEM_PROMPT = Path("F:/KnightBot/config/knight-prompt.md").read_text(encoding="utf-8")
 conversation_history = []
 LOCAL_MEMORY_DB = Path("F:/KnightBot/data/memory/knight_memory.db")
@@ -418,11 +445,6 @@ def local_recall_memories(query: str, limit: int = 3) -> List[Dict[str, str]]:
         return []
 
 
-@app.on_event("startup")
-async def startup_background_warmup():
-    asyncio.create_task(warmup_lm_model())
-
-
 class TokenRequest(BaseModel):
     room_name: str
     participant_name: str
@@ -450,6 +472,41 @@ class ChatRequest(BaseModel):
     images: list[str] | None = None  # List of base64 strings
 
 
+def should_stream_from_model(model: str) -> bool:
+    if not CONFIG.get("lm_stream_enabled", True):
+        return False
+    model_l = (model or "").strip().lower()
+    blocked = CONFIG.get("lm_force_nonstream_models", []) or []
+    return not any(entry and entry in model_l for entry in blocked)
+
+
+def looks_like_garbled_response(text: str) -> bool:
+    if not text or not isinstance(text, str):
+        return True
+    sample = text.strip()
+    if len(sample) < 3:
+        return True
+
+    alpha = sum(1 for ch in sample if ch.isalpha())
+    ascii_alpha = sum(1 for ch in sample if ch.isascii() and ch.isalpha())
+    cjk = sum(
+        1
+        for ch in sample
+        if ("\u4e00" <= ch <= "\u9fff")
+        or ("\u3040" <= ch <= "\u30ff")
+        or ("\uac00" <= ch <= "\ud7af")
+    )
+    noisy = sum(1 for ch in sample if ch in "{}[]<>|`~")
+
+    if alpha > 0 and (ascii_alpha / alpha) < 0.30 and cjk > 0:
+        return True
+    if ascii_alpha < 2 and len(sample) > 12:
+        return True
+    if noisy >= max(4, len(sample) // 8):
+        return True
+    return False
+
+
 async def run_lm_studio_chat(
     client: httpx.AsyncClient,
     *,
@@ -460,6 +517,7 @@ async def run_lm_studio_chat(
 ) -> tuple[str, dict]:
     """Call LM Studio and capture first-token latency when streaming is available."""
     target_url = f"{CONFIG['lm_studio']}/chat/completions"
+    request_timeout = float(CONFIG.get("lm_request_timeout_s", 180.0))
     base_payload = {
         "model": model,
         "messages": messages,
@@ -468,72 +526,80 @@ async def run_lm_studio_chat(
     }
 
     started = time.perf_counter()
-    try:
-        stream_payload = dict(base_payload)
-        stream_payload["stream"] = True
-        async with client.stream("POST", target_url, json=stream_payload) as r:
-            if r.status_code != 200:
-                raise httpx.HTTPStatusError(
-                    f"LM Studio stream returned status {r.status_code}",
-                    request=r.request,
-                    response=r,
-                )
+    use_stream = should_stream_from_model(model)
+    if use_stream:
+        try:
+            stream_payload = dict(base_payload)
+            stream_payload["stream"] = True
+            async with client.stream(
+                "POST", target_url, json=stream_payload, timeout=request_timeout
+            ) as r:
+                if r.status_code != 200:
+                    raise httpx.HTTPStatusError(
+                        f"LM Studio stream returned status {r.status_code}",
+                        request=r.request,
+                        response=r,
+                    )
 
-            chunks: list[str] = []
-            first_token_s: float | None = None
+                chunks: list[str] = []
+                first_token_s: float | None = None
 
-            async for line in r.aiter_lines():
-                if not line or not line.startswith("data:"):
-                    continue
+                async for line in r.aiter_lines():
+                    if not line or not line.startswith("data:"):
+                        continue
 
-                raw = line[5:].strip()
-                if not raw:
-                    continue
-                if raw == "[DONE]":
-                    break
+                    raw = line[5:].strip()
+                    if not raw:
+                        continue
+                    if raw == "[DONE]":
+                        break
 
-                try:
-                    payload = json.loads(raw)
-                except json.JSONDecodeError:
-                    continue
+                    try:
+                        payload = json.loads(raw)
+                    except json.JSONDecodeError:
+                        continue
 
-                choices = payload.get("choices") or []
-                if not choices:
-                    continue
+                    choices = payload.get("choices") or []
+                    if not choices:
+                        continue
 
-                choice0 = choices[0] or {}
-                delta = choice0.get("delta") or {}
-                token_piece = delta.get("content")
-                if isinstance(token_piece, str) and token_piece:
-                    if first_token_s is None:
-                        first_token_s = round(time.perf_counter() - started, 4)
-                    chunks.append(token_piece)
-                    continue
+                    choice0 = choices[0] or {}
+                    delta = choice0.get("delta") or {}
+                    token_piece = delta.get("content")
+                    if isinstance(token_piece, str) and token_piece:
+                        if first_token_s is None:
+                            first_token_s = round(time.perf_counter() - started, 4)
+                        chunks.append(token_piece)
+                        continue
 
-                message = choice0.get("message") or {}
-                message_piece = message.get("content")
-                if isinstance(message_piece, str) and message_piece:
-                    if first_token_s is None:
-                        first_token_s = round(time.perf_counter() - started, 4)
-                    chunks.append(message_piece)
+                    message = choice0.get("message") or {}
+                    message_piece = message.get("content")
+                    if isinstance(message_piece, str) and message_piece:
+                        if first_token_s is None:
+                            first_token_s = round(time.perf_counter() - started, 4)
+                        chunks.append(message_piece)
 
-            response_text = "".join(chunks).strip()
-            if response_text:
-                total_s = round(time.perf_counter() - started, 4)
-                return response_text, {
-                    "llm_mode": "stream",
-                    "llm_first_token_s": first_token_s if first_token_s is not None else total_s,
-                    "llm_total_s": total_s,
-                }
-    except Exception as e:
-        # Keep chat alive if stream mode is unavailable for a model/backend.
-        print(f"[warn] LM Studio streaming unavailable, using fallback mode: {e}")
+                response_text = "".join(chunks).strip()
+                if response_text:
+                    total_s = round(time.perf_counter() - started, 4)
+                    return response_text, {
+                        "llm_mode": "stream",
+                        "llm_first_token_s": first_token_s if first_token_s is not None else total_s,
+                        "llm_total_s": total_s,
+                    }
+        except Exception as e:
+            # Keep chat alive if stream mode is unavailable for a model/backend.
+            print(f"[warn] LM Studio streaming unavailable, using fallback mode: {e}")
+    else:
+        print(f"[info] LM Studio non-stream forced for model '{model}'")
 
-    r = await client.post(target_url, json=base_payload)
+    r = await client.post(target_url, json=base_payload, timeout=request_timeout)
     if r.status_code != 200:
         raise Exception(f"LM Studio Error: {r.status_code} - {r.text}")
 
-    response_text = r.json()["choices"][0]["message"]["content"]
+    response_text = str(r.json()["choices"][0]["message"]["content"]).strip()
+    if not response_text:
+        raise Exception("LM Studio returned an empty response")
     total_s = round(time.perf_counter() - started, 4)
     return response_text, {
         "llm_mode": "nonstream",
@@ -733,6 +799,36 @@ async def chat(req: ChatRequest):
                 temperature=temperature,
                 max_tokens=max_tokens,
             )
+            if looks_like_garbled_response(response_text):
+                print("[warn] Garbled/empty LM response detected; retrying with strict English rescue prompt")
+                rescue_messages = list(messages)
+                rescue_messages.append(
+                    {
+                        "role": "system",
+                        "content": "Respond in plain English only. Use normal punctuation and no markdown.",
+                    }
+                )
+                response_text, lm_metrics = await run_lm_studio_chat(
+                    client,
+                    model=model_to_use,
+                    messages=rescue_messages,
+                    temperature=min(float(temperature), 0.4),
+                    max_tokens=min(int(max_tokens), 256),
+                )
+                lm_metrics["llm_retry"] = "english_rescue"
+                if looks_like_garbled_response(response_text):
+                    fallback_model = str(CONFIG.get("lm_fallback_model_id", "")).strip()
+                    if fallback_model and fallback_model.lower() != model_to_use.lower():
+                        print(f"[warn] Rescue response still garbled; retrying on fallback model '{fallback_model}'")
+                        response_text, lm_metrics = await run_lm_studio_chat(
+                            client,
+                            model=fallback_model,
+                            messages=rescue_messages,
+                            temperature=min(float(temperature), 0.35),
+                            max_tokens=min(int(max_tokens), 256),
+                        )
+                        lm_metrics["llm_retry"] = "fallback_model"
+                        lm_metrics["fallback_model"] = fallback_model
             if req.include_audio:
                 update_voice_runtime_from_metrics(lm_metrics, voice_profile_name)
                 response_text = compact_voice_reply(
@@ -763,6 +859,14 @@ async def chat(req: ChatRequest):
                 "last_profile": VOICE_RUNTIME.get("last_profile", "chat"),
             }
         return payload
+    except httpx.TimeoutException:
+        timeout_s = float(CONFIG.get("lm_request_timeout_s", 180))
+        detail = (
+            f"LM Studio timed out after {timeout_s:.0f}s. "
+            "Reduce LM Studio context/response length or use a lighter preset."
+        )
+        print(f"⏱️ {detail}")
+        raise HTTPException(status_code=504, detail=detail)
     except Exception as e:
         import traceback
 
@@ -778,6 +882,10 @@ async def get_config():
         "temperature": CONFIG["temperature"],
         "max_tokens": CONFIG["max_tokens"],
         "voice_model_id": CONFIG["voice_model_id"],
+        "lm_fallback_model_id": CONFIG["lm_fallback_model_id"],
+        "lm_request_timeout_s": CONFIG["lm_request_timeout_s"],
+        "lm_stream_enabled": CONFIG["lm_stream_enabled"],
+        "lm_force_nonstream_models": CONFIG["lm_force_nonstream_models"],
         "voice_max_tokens": CONFIG["voice_max_tokens"],
         "voice_max_words": CONFIG["voice_max_words"],
         "voice_max_sentences": CONFIG["voice_max_sentences"],
@@ -808,6 +916,5 @@ if __name__ == "__main__":
             return record.getMessage().find("GET /health") == -1
 
     logging.getLogger("uvicorn.access").addFilter(HealthCheckFilter())
-    init_local_memory_db()
 
     uvicorn.run(app, host="0.0.0.0", port=8100)
