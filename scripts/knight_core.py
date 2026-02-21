@@ -62,6 +62,8 @@ CONFIG = {
     "voice_latency_fast_s": float(os.getenv("VOICE_LATENCY_FAST_S", "4.0")),
     "voice_latency_ema_alpha": float(os.getenv("VOICE_LATENCY_EMA_ALPHA", "0.35")),
     "max_history_messages": int(os.getenv("MAX_HISTORY_MESSAGES", "6")),
+    "voice_max_history_messages": int(os.getenv("VOICE_MAX_HISTORY_MESSAGES", "2")),
+    "voice_memory_limit": int(os.getenv("VOICE_MEMORY_LIMIT", "1")),
     "model_id": os.getenv(
         "MODEL_ID",
         "spatial-ssrl-qwen3vl-4b-i1",
@@ -468,6 +470,7 @@ class ChatRequest(BaseModel):
     include_audio: bool = False
     voice_id: str | None = None
     voice_profile: str | None = None
+    model_id: str | None = None
     system_prompt: str | None = None
     images: list[str] | None = None  # List of base64 strings
 
@@ -597,18 +600,29 @@ async def run_lm_studio_chat(
     if r.status_code != 200:
         raise Exception(f"LM Studio Error: {r.status_code} - {r.text}")
 
-    response_text = str(r.json()["choices"][0]["message"]["content"]).strip()
+    body = r.json()
+    response_text = str(body["choices"][0]["message"]["content"]).strip()
     if not response_text:
         raise Exception("LM Studio returned an empty response")
     total_s = round(time.perf_counter() - started, 4)
+    usage = body.get("usage") or {}
+    prompt_tokens = int(usage.get("prompt_tokens", 0) or 0)
+    completion_tokens = int(usage.get("completion_tokens", 0) or 0)
+    total_tokens = int(usage.get("total_tokens", 0) or 0)
+    tok_per_s = round((completion_tokens / total_s), 3) if total_s > 0 and completion_tokens > 0 else None
     return response_text, {
         "llm_mode": "nonstream",
         "llm_first_token_s": total_s,
         "llm_total_s": total_s,
+        "prompt_tokens": prompt_tokens,
+        "completion_tokens": completion_tokens,
+        "total_tokens": total_tokens,
+        "completion_tok_per_s": tok_per_s,
     }
 
 
-async def recall_memories(query: str):
+async def recall_memories(query: str, limit: int = 3):
+    limit = max(1, min(8, int(limit)))
     try:
         await ensure_mem0_user_ready()
         async with httpx.AsyncClient(timeout=3.0) as client:
@@ -619,7 +633,7 @@ async def recall_memories(query: str):
                     "user_id": CONFIG["user_id"],
                     "search_query": query,
                     "page": 1,
-                    "size": 3,
+                    "size": limit,
                 },
             )
             if r.status_code == 200:
@@ -639,7 +653,7 @@ async def recall_memories(query: str):
                         "user_id": CONFIG["user_id"],
                         "search_query": query,
                         "page": 1,
-                        "size": 3,
+                        "size": limit,
                     },
                 )
                 if r2.status_code == 200:
@@ -650,10 +664,10 @@ async def recall_memories(query: str):
                     if parsed:
                         return parsed
 
-            return local_recall_memories(query, limit=3)
+            return local_recall_memories(query, limit=limit)
     except Exception as e:
         print(f"[warn] Memory search failed: {e}")
-        return local_recall_memories(query, limit=3)
+        return local_recall_memories(query, limit=limit)
 
 
 async def store_memory(content: str):
@@ -710,7 +724,13 @@ async def chat(req: ChatRequest):
         f"📩 Incoming request: msg='{req.message[:50]}...' images={len(req.images) if req.images else 0}"
     )
 
-    memories = await recall_memories(req.message)
+    memory_limit = 3
+    if req.include_audio:
+        memory_limit = max(0, int(CONFIG.get("voice_memory_limit", 1)))
+
+    memories: List[Dict[str, Any]] = []
+    if memory_limit > 0:
+        memories = await recall_memories(req.message, limit=memory_limit)
 
     current_system_prompt = req.system_prompt or SYSTEM_PROMPT
     messages = [{"role": "system", "content": current_system_prompt}]
@@ -723,10 +743,14 @@ async def chat(req: ChatRequest):
 
     # Keep history window bounded to reduce prompt latency.
     history_window = max(0, int(CONFIG.get("max_history_messages", 6)))
+    if req.include_audio:
+        history_window = max(0, int(CONFIG.get("voice_max_history_messages", 2)))
     if history_window > 0:
         messages.extend(conversation_history[-history_window:])
 
     # Handle Multimodal Content
+    requested_model = (req.model_id or "").strip()
+
     if req.images:
         print(f"📸 Received {len(req.images)} images. Switching to vision model.")
         user_content = [{"type": "text", "text": req.message}]
@@ -757,13 +781,18 @@ async def chat(req: ChatRequest):
         # If that model supports vision, we should use it.
         # But VISION_MODEL_ID is hardcoded to llama-joycaption...
         # Let's use the current MODEL_ID if it looks like a VL model, otherwise fallback.
-        if "vl" in CONFIG["model_id"].lower():
+        if requested_model:
+            model_to_use = requested_model
+        elif "vl" in CONFIG["model_id"].lower():
             model_to_use = CONFIG["model_id"]
         else:
             model_to_use = CONFIG["vision_model_id"]
     else:
         messages.append({"role": "user", "content": req.message})
-        model_to_use = CONFIG["voice_model_id"] if req.include_audio else CONFIG["model_id"]
+        if requested_model:
+            model_to_use = requested_model
+        else:
+            model_to_use = CONFIG["voice_model_id"] if req.include_audio else CONFIG["model_id"]
 
     voice_profile_name = "chat"
     voice_profile_cfg = VOICE_PROFILES["chat"]
@@ -829,6 +858,16 @@ async def chat(req: ChatRequest):
                         )
                         lm_metrics["llm_retry"] = "fallback_model"
                         lm_metrics["fallback_model"] = fallback_model
+
+            prompt_tokens = lm_metrics.get("prompt_tokens")
+            completion_tokens = lm_metrics.get("completion_tokens")
+            tok_per_s = lm_metrics.get("completion_tok_per_s")
+            print(
+                "⏱️ LLM metrics "
+                f"mode={lm_metrics.get('llm_mode')} total={lm_metrics.get('llm_total_s')}s "
+                f"first={lm_metrics.get('llm_first_token_s')}s "
+                f"prompt_toks={prompt_tokens} completion_toks={completion_tokens} tok/s={tok_per_s}"
+            )
             if req.include_audio:
                 update_voice_runtime_from_metrics(lm_metrics, voice_profile_name)
                 response_text = compact_voice_reply(
@@ -895,6 +934,8 @@ async def get_config():
         "voice_latency_critical_s": CONFIG["voice_latency_critical_s"],
         "voice_latency_fast_s": CONFIG["voice_latency_fast_s"],
         "voice_explicit_profile_strict": CONFIG["voice_explicit_profile_strict"],
+        "voice_max_history_messages": CONFIG["voice_max_history_messages"],
+        "voice_memory_limit": CONFIG["voice_memory_limit"],
         "voice_profiles": VOICE_PROFILES,
         "voice_runtime": VOICE_RUNTIME,
         "max_history_messages": CONFIG["max_history_messages"],
