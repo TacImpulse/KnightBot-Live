@@ -147,7 +147,7 @@ pyparsing==3.3.2
 pyreadline3==3.5.4
 python-dateutil==2.9.0.post0
 python-dotenv==1.0.1
-python-multipart==0.0.21
+python-multipart==0.0.22
 pytorch-lightning==2.6.0
 pywin32==311
 PyYAML==6.0.3
