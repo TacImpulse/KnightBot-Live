@@ -8,7 +8,7 @@ KnightBot is a cutting-edge, local-first AI assistant that bridges the gap betwe
 
 ## 🌟 New Features (v2.0 - "Neural Link")
 
-*   **Neural Link Widget**: A sleek, draggable, collapsible voice interface that sits overlay on your screen.
+*   **Neural Link Widget**: A sleek, draggable, collapsible voice interface that sits overlayed on your screen.
 *   **Voice Cloning Lab**: Upload any clean WAV file (10-20s) to instantly clone and switch Knight's voice.
 *   **Avatar System**: Assign visual avatars (images) to voice profiles. (Future: Real-time animation support).
 *   **LiveKit Integration**: Robust, ultra-low latency audio streaming pipeline (Pipecat) for "interruptible" conversations.
